@@ -1,18 +1,10 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import {
-  Router,
-  type NextFunction,
-  type Request,
-  type Response,
-} from 'express';
+import { Router, type NextFunction, type Request, type RequestHandler, type Response } from 'express';
 import multer from 'multer';
-import { PublishOrchestrator } from '../orchestrator/publishOrchestrator';
-import {
-  validatePublishPayload,
-  type UploadedImageInfo,
-} from '../validation/postSchema';
+import type { PublishOrchestrator } from '../orchestrator/publishOrchestrator';
+import { validatePublishPayload } from '../validation/postSchema';
 
 export interface PublishRouterDeps {
   orchestrator: PublishOrchestrator;
@@ -22,118 +14,70 @@ export interface PublishRouterDeps {
 
 const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
 
+// Keep only a plain extension from the user's file name.
 function safeExtension(originalname: string): string {
   const ext = path.extname(originalname).toLowerCase();
   return /^\.[a-z0-9]{1,8}$/.test(ext) ? ext : '.bin';
 }
 
-function createUploadMiddleware(uploadsDir: string) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
+function removeFile(filePath?: string): Promise<void> {
+  return filePath ? fs.promises.unlink(filePath).catch(() => undefined) : Promise.resolve();
+}
 
-  const storage = multer.diskStorage({
-    destination: uploadsDir,
-    filename: (_req, file, cb) => {
-      const uniqueName = `${Date.now()}-${crypto.randomUUID()}${safeExtension(
-        file.originalname
-      )}`;
-      cb(null, uniqueName);
-    },
-  });
-
+/** Runs multer and answers upload errors (such as a file that is too large) with a 400. */
+function acceptImageUpload(uploadsDir: string): RequestHandler {
   const upload = multer({
-    storage,
+    storage: multer.diskStorage({
+      destination: uploadsDir,
+      filename: (_req, file, cb) =>
+        cb(null, `${Date.now()}-${crypto.randomUUID()}${safeExtension(file.originalname)}`),
+    }),
     limits: { fileSize: MAX_UPLOAD_BYTES },
   }).single('image');
 
-  return (req: Request, res: Response, next: NextFunction): void => {
+  return (req, res, next) => {
     upload(req, res, (err: unknown) => {
-      if (!err) {
-        next();
-        return;
-      }
+      if (!err) return next();
 
-      if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
-        res.status(400).json({ error: 'Image must be 8 MB or smaller.' });
-        return;
-      }
-
-      const message =
-        err instanceof Error ? err.message : 'File upload failed.';
-      res.status(400).json({ error: message });
+      const tooLarge = err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE';
+      res.status(400).json({ error: tooLarge ? 'Image must be 8 MB or smaller.' : 'File upload failed.' });
     });
   };
 }
 
-function toUploadedImageInfo(
-  file: Express.Multer.File | undefined
-): UploadedImageInfo | undefined {
-  if (!file) {
-    return undefined;
-  }
-
-  return {
-    path: file.path,
-    filename: file.filename,
-    mimetype: file.mimetype,
-    originalname: file.originalname,
-  };
-}
-
-async function cleanupUploadedFile(filePath: string | undefined): Promise<void> {
-  if (!filePath) {
-    return;
-  }
-
-  await fs.promises.unlink(filePath).catch(() => undefined);
-}
-
-function buildPublicImageUrl(
-  publicBaseUrl: string,
-  filename: string
-): string | undefined {
-  if (!publicBaseUrl) {
-    return undefined;
-  }
-
-  return `${publicBaseUrl}/uploads/${encodeURIComponent(filename)}`;
-}
-
-export function createPublishRouter(deps: PublishRouterDeps): Router {
+export function createPublishRouter({ orchestrator, publicBaseUrl, uploadsDir }: PublishRouterDeps): Router {
+  fs.mkdirSync(uploadsDir, { recursive: true });
   const router = Router();
-  const handleUpload = createUploadMiddleware(deps.uploadsDir);
 
   router.post(
     '/publish',
-    handleUpload,
+    acceptImageUpload(uploadsDir),
     async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-      const fileInfo = toUploadedImageInfo(req.file);
+      const file = req.file;
 
       try {
-        const validation = validatePublishPayload(req.body, fileInfo);
+        const validation = validatePublishPayload(req.body, file);
         if (!validation.ok) {
-          await cleanupUploadedFile(fileInfo?.path);
-          res.status(400).json({
-            error: validation.errors[0],
-            errors: validation.errors,
-          });
+          await removeFile(file?.path);
+          res.status(400).json({ error: validation.errors[0], errors: validation.errors });
           return;
         }
 
-        const imageUrl = fileInfo
-          ? buildPublicImageUrl(deps.publicBaseUrl, fileInfo.filename)
-          : undefined;
+        // Instagram and Threads fetch the image from this public URL.
+        const imageUrl =
+          file && publicBaseUrl
+            ? `${publicBaseUrl}/uploads/${encodeURIComponent(file.filename)}`
+            : undefined;
 
-        const results = await deps.orchestrator.publish({
-          text: validation.data.text,
-          platforms: validation.data.platforms,
-          imagePath: fileInfo?.path,
+        const results = await orchestrator.publish({
+          ...validation.data,
+          imagePath: file?.path,
           imageUrl,
-          imageMimeType: fileInfo?.mimetype,
+          imageMimeType: file?.mimetype,
         });
-
-        res.status(200).json({ results });
+        res.json({ results });
       } catch (err: unknown) {
-        await cleanupUploadedFile(fileInfo?.path);
+        await removeFile(file?.path);
         next(err);
       }
     }

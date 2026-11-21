@@ -7,319 +7,207 @@ interface PlatformResult {
   error?: string;
 }
 
-interface PublishApiResponse {
+// Shape of what /api/publish sends back (our own server, so we trust it).
+interface PublishResponse {
   results?: PlatformResult[];
-  error?: string;
   errors?: string[];
+  error?: string;
 }
 
-const PLATFORM_LIMITS: Record<Platform, number> = {
-  facebook: 63206,
-  instagram: 2200,
-  threads: 500,
+const PLATFORMS: Record<Platform, { label: string; limit: number }> = {
+  facebook: { label: 'Facebook', limit: 63206 },
+  instagram: { label: 'Instagram', limit: 2200 },
+  threads: { label: 'Threads', limit: 500 },
 };
 
-const PLATFORM_LABELS: Record<Platform, string> = {
-  facebook: 'Facebook',
-  instagram: 'Instagram',
-  threads: 'Threads',
-};
+const byId = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 
-function requireElement<T extends HTMLElement>(id: string): T {
-  const element = document.getElementById(id);
-  if (!element) {
-    throw new Error(`Missing required element #${id}`);
-  }
-  return element as T;
+const form = byId<HTMLFormElement>('publish-form');
+const errorBox = byId<HTMLDivElement>('form-error');
+const textInput = byId<HTMLTextAreaElement>('post-text');
+const imageInput = byId<HTMLInputElement>('post-image');
+const counters = byId<HTMLDivElement>('char-counters');
+const publishButton = byId<HTMLButtonElement>('publish-btn');
+const resultsSection = byId<HTMLElement>('results-section');
+const resultsStatus = byId<HTMLParagraphElement>('results-status');
+const resultsList = byId<HTMLUListElement>('results-list');
+
+const checkboxes = [...form.querySelectorAll<HTMLInputElement>('input[name="platforms"]')];
+
+function selectedPlatforms(): Platform[] {
+  return checkboxes.filter((box) => box.checked).map((box) => box.value as Platform);
 }
 
-function isPlatform(value: string): value is Platform {
-  return value === 'facebook' || value === 'instagram' || value === 'threads';
+function element(tag: string, text: string, className = ''): HTMLElement {
+  const el = document.createElement(tag);
+  el.textContent = text;
+  el.className = className;
+  return el;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
+// ---- Character counters ----
 
-function isPlatformResult(value: unknown): value is PlatformResult {
-  if (!isRecord(value)) {
-    return false;
-  }
+function renderCounters(): void {
+  const length = textInput.value.length;
+  const platforms = selectedPlatforms();
 
-  if (typeof value.platform !== 'string' || !isPlatform(value.platform)) {
-    return false;
-  }
-
-  return typeof value.success === 'boolean';
-}
-
-function parseApiResponse(payload: unknown): PublishApiResponse {
-  if (!isRecord(payload)) {
-    return {};
-  }
-
-  const results = Array.isArray(payload.results)
-    ? payload.results.filter(isPlatformResult)
-    : undefined;
-  const errors = Array.isArray(payload.errors)
-    ? payload.errors.filter((item): item is string => typeof item === 'string')
-    : undefined;
-  const error = typeof payload.error === 'string' ? payload.error : undefined;
-
-  return { results, errors, error };
-}
-
-function isJpegFile(file: File): boolean {
-  const mime = file.type.toLowerCase();
-  const hasJpegExtension = /\.(jpe?g)$/i.test(file.name);
-  return mime === 'image/jpeg' && hasJpegExtension;
-}
-
-const formEl = requireElement<HTMLFormElement>('publish-form');
-const formErrorEl = requireElement<HTMLDivElement>('form-error');
-const textEl = requireElement<HTMLTextAreaElement>('post-text');
-const countersEl = requireElement<HTMLDivElement>('char-counters');
-const imageEl = requireElement<HTMLInputElement>('post-image');
-const publishBtnEl = requireElement<HTMLButtonElement>('publish-btn');
-const resultsSectionEl = requireElement<HTMLElement>('results-section');
-const resultsStatusEl = requireElement<HTMLParagraphElement>('results-status');
-const resultsListEl = requireElement<HTMLUListElement>('results-list');
-
-const platformCheckboxes = Array.from(
-  formEl.querySelectorAll<HTMLInputElement>('input[name="platforms"]')
-);
-
-function getSelectedPlatforms(): Platform[] {
-  const selected: Platform[] = [];
-  for (const checkbox of platformCheckboxes) {
-    if (checkbox.checked && isPlatform(checkbox.value)) {
-      selected.push(checkbox.value);
-    }
-  }
-  return selected;
-}
-
-function renderCharCounters(): void {
-  const selected = getSelectedPlatforms();
-  const length = textEl.value.length;
-  const nodes: HTMLElement[] = [];
-
-  if (selected.length === 0) {
-    const emptyNote = document.createElement('span');
-    emptyNote.className = 'counter-empty';
-    emptyNote.textContent = 'Select at least one platform.';
-    countersEl.replaceChildren(emptyNote);
+  if (platforms.length === 0) {
+    counters.replaceChildren(element('span', 'Select at least one platform.', 'counter-empty'));
     return;
   }
 
-  for (const platform of selected) {
-    const limit = PLATFORM_LIMITS[platform];
-    const isOver = length > limit;
-    const item = document.createElement('span');
-    item.className = isOver ? 'counter-item counter-over' : 'counter-item';
-    item.textContent = `${PLATFORM_LABELS[platform]}: ${length.toLocaleString()} / ${limit.toLocaleString()}${
-      isOver ? ' — Over limit' : ''
-    }`;
-    nodes.push(item);
-  }
-
-  countersEl.replaceChildren(...nodes);
+  counters.replaceChildren(
+    ...platforms.map((platform) => {
+      const { label, limit } = PLATFORMS[platform];
+      const over = length > limit;
+      const text = `${label}: ${length.toLocaleString()} / ${limit.toLocaleString()}${over ? ' — Over limit' : ''}`;
+      return element('span', text, over ? 'counter-item counter-over' : 'counter-item');
+    })
+  );
 }
 
-interface ClientValidation {
-  errors: string[];
-  invalidFields: Set<'text' | 'image'>;
+// ---- Validation (the server checks again; this just saves a round trip) ----
+
+interface Problems {
+  messages: string[];
+  badText: boolean;
+  badImage: boolean;
 }
 
-function validateForm(): ClientValidation {
-  const selected = getSelectedPlatforms();
-  const text = textEl.value;
-  const imageFile = imageEl.files?.[0];
-  const errors: string[] = [];
-  const invalidFields = new Set<'text' | 'image'>();
+function findProblems(): Problems {
+  const platforms = selectedPlatforms();
+  const text = textInput.value;
+  const image = imageInput.files?.[0];
+  const problems: Problems = { messages: [], badText: false, badImage: false };
 
-  if (selected.length === 0) {
-    errors.push('Select at least one platform.');
+  if (platforms.length === 0) problems.messages.push('Select at least one platform.');
+
+  if (!image && !text.trim()) {
+    problems.messages.push('Enter post text or attach an image.');
+    problems.badText = true;
   }
 
-  if (!imageFile && text.trim().length === 0) {
-    errors.push('Enter post text or attach an image.');
-    invalidFields.add('text');
-  }
-
-  if (selected.includes('instagram')) {
-    if (!imageFile) {
-      errors.push(
-        'Instagram requires an image. Attach a JPEG image or uncheck Instagram.'
-      );
-      invalidFields.add('image');
-    } else if (!isJpegFile(imageFile)) {
-      errors.push('Instagram only accepts JPEG images (.jpg or .jpeg).');
-      invalidFields.add('image');
+  if (platforms.includes('instagram')) {
+    const isJpeg = image && image.type === 'image/jpeg' && /\.jpe?g$/i.test(image.name);
+    if (!image) {
+      problems.messages.push('Instagram requires an image. Attach a JPEG image or uncheck Instagram.');
+      problems.badImage = true;
+    } else if (!isJpeg) {
+      problems.messages.push('Instagram only accepts JPEG images (.jpg or .jpeg).');
+      problems.badImage = true;
     }
   }
 
-  for (const platform of selected) {
-    const limit = PLATFORM_LIMITS[platform];
+  for (const platform of platforms) {
+    const { label, limit } = PLATFORMS[platform];
     if (text.length > limit) {
-      errors.push(
-        `Text exceeds the ${PLATFORM_LABELS[platform]} limit of ${limit} characters (currently ${text.length}).`
+      problems.messages.push(`Text exceeds the ${label} limit of ${limit} characters (currently ${text.length}).`);
+      problems.badText = true;
+    }
+  }
+
+  return problems;
+}
+
+function clearErrors(): void {
+  errorBox.hidden = true;
+  errorBox.replaceChildren();
+  textInput.setAttribute('aria-invalid', 'false');
+  imageInput.setAttribute('aria-invalid', 'false');
+}
+
+function showErrors(messages: string[], badText = false, badImage = false): void {
+  textInput.setAttribute('aria-invalid', String(badText));
+  imageInput.setAttribute('aria-invalid', String(badImage));
+
+  const list = document.createElement('ul');
+  list.append(...messages.map((message) => element('li', message)));
+  errorBox.replaceChildren(list);
+  errorBox.hidden = false;
+  errorBox.focus(); // Screen readers announce the error summary when it gets focus.
+}
+
+// ---- Results ----
+
+function renderResults(results: PlatformResult[]): void {
+  const succeeded = results.filter((result) => result.success).length;
+
+  resultsList.replaceChildren(
+    ...results.map((result) => {
+      const card = document.createElement('li');
+      card.className = `result-card ${result.success ? 'result-success' : 'result-failure'}`;
+
+      const header = element('div', '', 'result-header');
+      header.append(
+        element('span', PLATFORMS[result.platform].label),
+        element('span', result.success ? 'Success' : 'Failed', 'result-badge')
       );
-      invalidFields.add('text');
-    }
-  }
 
-  return { errors, invalidFields };
+      const detail = result.success
+        ? `Post ID: ${result.postId ?? 'Unknown'}`
+        : result.error ?? 'Publishing failed.';
+      card.append(header, element('p', detail, 'result-detail'));
+      return card;
+    })
+  );
+
+  resultsSection.hidden = false;
+  resultsStatus.textContent = `Publish complete: ${succeeded} succeeded, ${results.length - succeeded} failed.`;
 }
 
-function clearFormErrors(): void {
-  formErrorEl.hidden = true;
-  formErrorEl.replaceChildren();
-  textEl.setAttribute('aria-invalid', 'false');
-  imageEl.setAttribute('aria-invalid', 'false');
-}
+// ---- Submit ----
 
-function showFormErrors(
-  errors: readonly string[],
-  invalidFields: Set<'text' | 'image'>
-): void {
-  textEl.setAttribute('aria-invalid', invalidFields.has('text') ? 'true' : 'false');
-  imageEl.setAttribute('aria-invalid', invalidFields.has('image') ? 'true' : 'false');
+async function publish(): Promise<void> {
+  const response = await fetch('/api/publish', { method: 'POST', body: new FormData(form) });
+  const body = (await response.json().catch(() => ({}))) as PublishResponse;
 
-  if (errors.length === 1) {
-    const paragraph = document.createElement('p');
-    paragraph.textContent = errors[0];
-    formErrorEl.replaceChildren(paragraph);
-  } else {
-    const list = document.createElement('ul');
-    for (const message of errors) {
-      const li = document.createElement('li');
-      li.textContent = message;
-      list.append(li);
-    }
-    formErrorEl.replaceChildren(list);
-  }
-
-  formErrorEl.hidden = false;
-  formErrorEl.focus();
-}
-
-function renderResults(results: readonly PlatformResult[]): void {
-  const items: HTMLLIElement[] = [];
-  let successCount = 0;
-
-  for (const result of results) {
-    if (result.success) {
-      successCount += 1;
-    }
-
-    const li = document.createElement('li');
-    li.className = result.success
-      ? 'result-card result-success'
-      : 'result-card result-failure';
-
-    const header = document.createElement('div');
-    header.className = 'result-header';
-
-    const platformName = document.createElement('span');
-    platformName.textContent = PLATFORM_LABELS[result.platform];
-
-    const badge = document.createElement('span');
-    badge.className = 'result-badge';
-    badge.textContent = result.success ? 'Success' : 'Failed';
-
-    header.append(platformName, badge);
-
-    const detail = document.createElement('p');
-    detail.className = 'result-detail';
-    detail.textContent = result.success
-      ? `Post ID: ${result.postId ?? 'Unknown'}`
-      : result.error ?? 'Publishing failed.';
-
-    li.append(header, detail);
-    items.push(li);
-  }
-
-  const failureCount = results.length - successCount;
-  resultsListEl.replaceChildren(...items);
-  resultsSectionEl.hidden = false;
-  resultsStatusEl.textContent = `Publish complete: ${successCount} succeeded, ${failureCount} failed.`;
-}
-
-function syncValidationOnEdit(): void {
-  if (formErrorEl.hidden) {
+  if (response.ok && body.results) {
+    renderResults(body.results);
     return;
   }
 
-  const validation = validateForm();
-  if (validation.errors.length === 0) {
-    clearFormErrors();
-  }
+  const messages = body.errors ?? [body.error ?? `Request failed (HTTP ${response.status}).`];
+  showErrors(messages);
 }
 
-async function handleSubmit(event: SubmitEvent): Promise<void> {
+form.addEventListener('submit', async (event) => {
   event.preventDefault();
 
-  const validation = validateForm();
-  if (validation.errors.length > 0) {
-    showFormErrors(validation.errors, validation.invalidFields);
+  const problems = findProblems();
+  if (problems.messages.length > 0) {
+    showErrors(problems.messages, problems.badText, problems.badImage);
     return;
   }
 
-  clearFormErrors();
-  publishBtnEl.disabled = true;
-  publishBtnEl.textContent = 'Publishing...';
+  clearErrors();
+  publishButton.disabled = true; // Stops double-posting while the request runs.
+  publishButton.textContent = 'Publishing...';
 
   try {
-    const response = await fetch('/api/publish', {
-      method: 'POST',
-      body: new FormData(formEl),
-    });
-
-    const rawBody = (await response.json().catch(() => undefined)) as unknown;
-    const body = parseApiResponse(rawBody);
-
-    if (!response.ok) {
-      const serverErrors =
-        body.errors && body.errors.length > 0
-          ? body.errors
-          : [body.error ?? `Request failed (HTTP ${response.status}).`];
-      showFormErrors(serverErrors, new Set());
-      return;
-    }
-
-    if (body.results) {
-      renderResults(body.results);
-    }
+    await publish();
   } catch {
-    showFormErrors(
-      ['Could not reach the server. Check that the app is running and try again.'],
-      new Set()
-    );
+    showErrors(['Could not reach the server. Check that the app is running and try again.']);
   } finally {
-    publishBtnEl.disabled = false;
-    publishBtnEl.textContent = 'Publish';
+    publishButton.disabled = false;
+    publishButton.textContent = 'Publish';
   }
+});
+
+// Once errors are showing, clear them as soon as the form becomes valid.
+function clearErrorsWhenFixed(): void {
+  if (!errorBox.hidden && findProblems().messages.length === 0) clearErrors();
 }
 
-textEl.addEventListener('input', () => {
-  renderCharCounters();
-  syncValidationOnEdit();
+textInput.addEventListener('input', () => {
+  renderCounters();
+  clearErrorsWhenFixed();
 });
+imageInput.addEventListener('change', clearErrorsWhenFixed);
+checkboxes.forEach((box) =>
+  box.addEventListener('change', () => {
+    renderCounters();
+    clearErrorsWhenFixed();
+  })
+);
 
-imageEl.addEventListener('change', () => {
-  syncValidationOnEdit();
-});
-
-for (const checkbox of platformCheckboxes) {
-  checkbox.addEventListener('change', () => {
-    renderCharCounters();
-    syncValidationOnEdit();
-  });
-}
-
-formEl.addEventListener('submit', (event) => {
-  void handleSubmit(event);
-});
-
-renderCharCounters();
+renderCounters();

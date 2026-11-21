@@ -1,11 +1,8 @@
 import path from 'node:path';
 import { z } from 'zod';
-import { isRecord } from '../services/metaError';
-import { PLATFORM_CHAR_LIMITS, type Platform } from '../types/post';
+import { PLATFORM_CHAR_LIMITS, PLATFORM_LABELS, type Platform } from '../types/post';
 
 export interface UploadedImageInfo {
-  path: string;
-  filename: string;
   mimetype: string;
   originalname: string;
 }
@@ -14,126 +11,50 @@ export type ValidationResult =
   | { ok: true; data: { text: string; platforms: Platform[] } }
   | { ok: false; errors: string[] };
 
-const PLATFORM_LABELS: Record<Platform, string> = {
-  facebook: 'Facebook',
-  instagram: 'Instagram',
-  threads: 'Threads',
-};
+// A form sends one `platforms` field per checked box: nothing, a string, or an array.
+const toArray = (raw: unknown): unknown => (raw === undefined ? [] : Array.isArray(raw) ? raw : [raw]);
 
-function deduplicateStrings(values: readonly string[]): string[] {
-  const seen = new Set<string>();
-  const unique: string[] = [];
-
-  for (const rawItem of values) {
-    const item = rawItem.trim();
-    if (item.length > 0 && !seen.has(item)) {
-      seen.add(item);
-      unique.push(item);
-    }
-  }
-
-  return unique;
-}
-
-function normalizePlatforms(raw: unknown): unknown {
-  if (raw === undefined || raw === null) {
-    return [];
-  }
-
-  if (Array.isArray(raw)) {
-    const stringItems = raw.filter(
-      (item): item is string => typeof item === 'string'
-    );
-    return stringItems.length === raw.length
-      ? deduplicateStrings(stringItems)
-      : raw;
-  }
-
-  if (typeof raw === 'string') {
-    const trimmed = raw.trim();
-    if (trimmed.length === 0) {
-      return [];
-    }
-
-    if (trimmed.startsWith('[')) {
-      try {
-        const parsed = JSON.parse(trimmed) as unknown;
-        if (Array.isArray(parsed)) {
-          return normalizePlatforms(parsed);
-        }
-      } catch {
-        return raw;
-      }
-    }
-
-    return deduplicateStrings(trimmed.split(','));
-  }
-
-  return raw;
-}
-
-function isJpegFile(file: UploadedImageInfo): boolean {
-  const mime = file.mimetype.toLowerCase();
-  const ext = path.extname(file.originalname).toLowerCase();
-  return mime === 'image/jpeg' && (ext === '.jpg' || ext === '.jpeg');
-}
-
-const publishBodySchema = z.object({
-  text: z.preprocess((v) => (typeof v === 'string' ? v : ''), z.string()),
+const bodySchema = z.object({
+  text: z.string().default(''),
   platforms: z.preprocess(
-    normalizePlatforms,
-    z
-      .array(z.enum(['facebook', 'instagram', 'threads']))
-      .min(1, 'Select at least one platform.')
+    toArray,
+    z.array(z.enum(['facebook', 'instagram', 'threads'])).min(1, 'Select at least one platform.')
   ),
 });
 
-export function validatePublishPayload(
-  body: unknown,
-  file?: UploadedImageInfo
-): ValidationResult {
-  const safeBody = isRecord(body) ? body : {};
-  const parsed = publishBodySchema.safeParse(safeBody);
+function isJpeg({ mimetype, originalname }: UploadedImageInfo): boolean {
+  const ext = path.extname(originalname).toLowerCase();
+  return mimetype.toLowerCase() === 'image/jpeg' && (ext === '.jpg' || ext === '.jpeg');
+}
 
+function imageErrors(platforms: Platform[], file?: UploadedImageInfo): string[] {
+  if (!platforms.includes('instagram')) return [];
+  if (!file) return ['Instagram requires an image. Attach a JPEG image or uncheck Instagram.'];
+  return isJpeg(file) ? [] : ['Instagram only accepts JPEG images (.jpg or .jpeg).'];
+}
+
+function lengthErrors(platforms: Platform[], text: string): string[] {
+  return platforms
+    .filter((platform) => text.length > PLATFORM_CHAR_LIMITS[platform])
+    .map(
+      (platform) =>
+        `Text exceeds the ${PLATFORM_LABELS[platform]} limit of ${PLATFORM_CHAR_LIMITS[platform]} characters (currently ${text.length}).`
+    );
+}
+
+export function validatePublishPayload(body: unknown, file?: UploadedImageInfo): ValidationResult {
+  const parsed = bodySchema.safeParse(body ?? {});
   if (!parsed.success) {
-    return {
-      ok: false,
-      errors: parsed.error.issues.map((issue) => issue.message),
-    };
+    return { ok: false, errors: parsed.error.issues.map((issue) => issue.message) };
   }
 
-  const { text, platforms } = parsed.data;
-  const errors: string[] = [];
+  const { text } = parsed.data;
+  const platforms = [...new Set(parsed.data.platforms)];
+  const errors = [
+    ...(!file && !text.trim() ? ['Enter post text or attach an image.'] : []),
+    ...imageErrors(platforms, file),
+    ...lengthErrors(platforms, text),
+  ];
 
-  if (!file && text.trim().length === 0) {
-    errors.push('Enter post text or attach an image.');
-  }
-
-  if (platforms.includes('instagram')) {
-    if (!file) {
-      errors.push(
-        'Instagram requires an image. Attach a JPEG image or uncheck Instagram.'
-      );
-    } else if (!isJpegFile(file)) {
-      errors.push('Instagram only accepts JPEG images (.jpg or .jpeg).');
-    }
-  }
-
-  for (const platform of platforms) {
-    const limit = PLATFORM_CHAR_LIMITS[platform];
-    if (text.length > limit) {
-      errors.push(
-        `Text exceeds the ${PLATFORM_LABELS[platform]} limit of ${limit} characters (currently ${text.length}).`
-      );
-    }
-  }
-
-  if (errors.length > 0) {
-    return { ok: false, errors };
-  }
-
-  return {
-    ok: true,
-    data: { text, platforms },
-  };
+  return errors.length > 0 ? { ok: false, errors } : { ok: true, data: { text, platforms } };
 }

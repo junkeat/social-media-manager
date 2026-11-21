@@ -3,72 +3,51 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export function redactTokens(text: string, tokens: readonly string[]): string {
-  const uniqueTokens = Array.from(
-    new Set(tokens.map((t) => t.trim()).filter((t) => t.length > 0))
-  ).sort((a, b) => b.length - a.length);
-
-  let sanitized = text;
-  for (const token of uniqueTokens) {
-    sanitized = sanitized.split(token).join('[REDACTED]');
+  let safe = text;
+  for (const token of tokens.filter(Boolean)) {
+    safe = safe.split(token).join('[REDACTED]');
   }
-
-  return sanitized.replace(/access_token=[^&\s"']+/gi, 'access_token=[REDACTED]');
+  return safe.replace(/access_token=[^&\s"']+/gi, 'access_token=[REDACTED]');
 }
 
 export async function safeParseJson(response: Response): Promise<unknown> {
-  const raw = await response.text();
-  if (!raw.trim()) {
-    return undefined;
-  }
-
   try {
-    return JSON.parse(raw) as unknown;
+    return JSON.parse(await response.text()) as unknown;
   } catch {
     return undefined;
   }
 }
 
+/** Turns a failed Meta API reply into a short, token-free message. */
 export function parseMetaError(
   status: number,
   body: unknown,
-  platformLabel: string,
+  label: string,
   tokens: readonly string[]
 ): string {
-  const errorObj = isRecord(body) && isRecord(body.error) ? body.error : undefined;
-  const message =
-    typeof errorObj?.message === 'string' ? errorObj.message.trim() : '';
-  const code = typeof errorObj?.code === 'number' ? errorObj.code : undefined;
-  const subcode =
-    typeof errorObj?.error_subcode === 'number' ? errorObj.error_subcode : undefined;
+  const error = isRecord(body) && isRecord(body.error) ? body.error : {};
+  const { message, code, error_subcode: subcode } = error;
 
-  // Meta OAuth code 190 (and HTTP 401) indicates an invalid or expired access token.
+  // Code 190 (or HTTP 401) means the access token is invalid or expired.
   if (status === 401 || code === 190) {
-    if (subcode === 463) {
-      return `${platformLabel} access token has expired. Generate a new token and update .env.`;
-    }
-    return `${platformLabel} access token is invalid or expired. Check your token in .env.`;
+    return subcode === 463
+      ? `${label} access token has expired. Generate a new token and update .env.`
+      : `${label} access token is invalid or expired. Check your token in .env.`;
   }
 
-  if (message.length > 0) {
-    const safeMessage = redactTokens(message, tokens);
-    return code !== undefined ? `${safeMessage} (code ${code})` : safeMessage;
+  if (typeof message === 'string' && message.trim()) {
+    const safe = redactTokens(message.trim(), tokens);
+    return typeof code === 'number' ? `${safe} (code ${code})` : safe;
   }
 
-  return `${platformLabel} API request failed with HTTP ${status}.`;
+  return `${label} API request failed with HTTP ${status}.`;
 }
 
 export function formatUnexpectedError(
   err: unknown,
-  platformLabel: string,
+  label: string,
   tokens: readonly string[]
 ): string {
-  const rawMessage =
-    err instanceof Error
-      ? err.message
-      : typeof err === 'string'
-        ? err
-        : `${platformLabel} request failed unexpectedly.`;
-
-  const normalized = rawMessage.trim() || `${platformLabel} request failed unexpectedly.`;
-  return redactTokens(normalized, tokens);
+  const message = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
+  return redactTokens(message.trim() || `${label} request failed unexpectedly.`, tokens);
 }
