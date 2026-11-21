@@ -1,0 +1,7 @@
+node_modules/
+dist/
+dist-test/
+.env
+uploads/*
+!uploads/.gitkeep
+public/app.js
